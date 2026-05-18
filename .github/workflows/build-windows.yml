@@ -22,7 +22,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install PyInstaller
-        run: pip install pyinstaller
+        run: pip install pyinstaller==6.11.1
 
       - name: Build
         run: pyinstaller --onefile --uac-admin --console --name FH6Lang fh6lang.py

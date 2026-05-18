@@ -20,7 +20,7 @@
 
 到 [Releases](../../releases) 下载 `FH6Lang.exe`，双击运行。会自动弹 UAC 提权（Xbox 版可能用得上）。
 
-或者本地装了 Python 3 的话：
+或者本地装了 **Python 3.10+** 的话：
 
 ```
 python fh6lang.py
@@ -48,7 +48,15 @@ SteamOS 默认有 Python 3，不需要装额外东西。
 python fh6lang.py --path "D:\SteamLibrary\steamapps\common\ForzaHorizon6"
 python fh6lang.py --no-uac       # Windows 不要求管理员
 python fh6lang.py --no-pause     # 结束不暂停（CI/脚本用）
+
+# 非交互（任三选一互斥）
+python fh6lang.py --status                  # 只打印当前状态
+python fh6lang.py --apply                   # 直接应用：中文 UI + 日语配音
+python fh6lang.py --apply --force           # 状态未知时强行应用
+python fh6lang.py --revert                  # 还原原始语言包
 ```
+
+非交互模式下不会弹版本选择菜单，会按 Steam 默认尝试自动检测；如果检测不到，请配合 `--path` 指定。
 
 ## 状态文件位置
 
