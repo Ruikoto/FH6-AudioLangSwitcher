@@ -10,10 +10,6 @@ build/
 dist/
 *.spec
 
-# 测试
-tests/fixture/
-.pytest_cache/
-
 # IDE
 .vscode/
 .idea/

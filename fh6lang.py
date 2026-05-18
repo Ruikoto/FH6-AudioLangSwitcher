@@ -65,6 +65,22 @@ def _enable_vt_on_windows() -> bool:
         return False
 
 
+def _force_console_utf8() -> None:
+    # 默认 Windows cmd 是 GBK，print 到带 ✓✗⚠ 的字符串会 UnicodeEncodeError 崩
+    if IS_WINDOWS:
+        try:
+            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+            ctypes.windll.kernel32.SetConsoleCP(65001)
+        except Exception:
+            pass
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError):
+            pass
+
+
+_force_console_utf8()
 USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR") and _enable_vt_on_windows()
 
 
@@ -103,12 +119,13 @@ def relaunch_as_admin_windows() -> bool:
     if not IS_WINDOWS or is_admin_windows():
         return False
     try:
+        exe = sys.executable
         if getattr(sys, "frozen", False):
-            exe = sys.executable
-            params = " ".join(f'"{a}"' for a in sys.argv[1:])
+            argv = sys.argv[1:]
         else:
-            exe = sys.executable
-            params = " ".join(f'"{a}"' for a in [sys.argv[0]] + sys.argv[1:])
+            argv = [sys.argv[0]] + sys.argv[1:]
+        # list2cmdline 处理含空格 / 引号的参数，比手工拼引号稳
+        params = subprocess.list2cmdline(argv)
         rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
         return int(rc) > 32
     except Exception as e:
@@ -387,7 +404,7 @@ def find_xbox_game() -> Path | None:
             try:
                 raw = gaming_root.read_bytes()
                 # 跳过 4 字节 RGBX 头，剩下是 UTF-16LE 字符串
-                if raw[:4] in (b"RGBX", b"GBXR") and len(raw) > 4:
+                if raw[:4] == b"RGBX" and len(raw) > 4:
                     txt = raw[4:].decode("utf-16-le", errors="ignore").rstrip("\x00")
                     if txt:
                         rel = Path(txt.replace("\\", "/").lstrip("/").lstrip(":"))
@@ -466,6 +483,12 @@ def sha256_of(path: Path) -> str:
     return h.hexdigest()
 
 
+def _install_key(install_dir: Path) -> str:
+    # Windows 不区分大小写，lower() 防止同一目录被记成两条状态
+    s = str(install_dir.resolve())
+    return s.lower() if IS_WINDOWS else s
+
+
 def state_file_path() -> Path:
     if IS_WINDOWS:
         base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
@@ -488,7 +511,10 @@ def load_state() -> dict:
 def save_state(state: dict) -> None:
     p = state_file_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    # tmp + replace 避免写到一半被中断留下半截 json
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, p)
 
 
 # ---------------------------------------------------------------------------
@@ -500,8 +526,8 @@ def user_pref_path(version: str, steam_appid: str | None = None) -> Path | None:
     if IS_WINDOWS:
         base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
         return base / USER_PREF_DIR / USER_PREF_FILE
-    # Linux: 仅 Steam 版有效（Proton compatdata）
-    if version not in ("steam", "manual"):
+    # Linux: 只有 Steam 版能定位（要 Proton compatdata），manual 路径无从推断
+    if version != "steam":
         return None
     appid = steam_appid or GAME_STEAM_APPID
     for root in find_steam_root():
@@ -516,7 +542,8 @@ def read_user_pref(path: Path) -> str | None:
     if not path.exists():
         return None
     try:
-        return path.read_bytes().decode("utf-8", errors="replace").strip()
+        # utf-8-sig 处理万一游戏写出带 BOM 的情况
+        return path.read_bytes().decode("utf-8-sig", errors="replace").strip()
     except Exception:
         return None
 
@@ -602,8 +629,11 @@ def prompt_version_choice() -> str:
         ans = ask("请输入选项").lower()
         if ans in ("1", "steam"):
             return "steam"
-        if ans in ("2", "xbox") and IS_WINDOWS:
-            return "xbox"
+        if ans in ("2", "xbox"):
+            if IS_WINDOWS:
+                return "xbox"
+            warn("Xbox / Game Pass 版仅在 Windows 上可用，请改选 1 或 3。")
+            continue
         if ans in ("3", "manual"):
             return "manual"
         if ans in ("q", "quit", "exit"):
@@ -711,19 +741,27 @@ def run(args: argparse.Namespace) -> int:
     if IS_WINDOWS and not is_admin_windows() and not args.no_uac:
         info("尝试以管理员身份重启（用于写入受保护路径）...")
         if relaunch_as_admin_windows():
-            return 0  # 已启动新进程，本进程退出
+            # 已弹出提权进程，本进程立即退出，避免双窗口同时停在 "按回车键退出"
+            sys.exit(0)
         warn("提权失败或被取消，继续以普通权限运行（Xbox 版可能写不进去）。")
+
+    non_interactive = args.apply or args.revert or args.status
 
     if args.path:
         version = "manual"
         install_dir = Path(args.path).expanduser()
         steam_appid = None
+    elif non_interactive:
+        # 非交互模式无法弹版本选择菜单，按 platform 默认尝试 Steam
+        version = "steam"
+        install_dir, steam_appid = detect_install(version)
     else:
         version = prompt_version_choice()
         install_dir, steam_appid = detect_install(version)
         install_dir = confirm_install_dir(install_dir)
     if install_dir is None:
-        fail("未确定游戏目录，退出。")
+        fail("未确定游戏目录，退出（非交互模式请加 --path 指定）。" if non_interactive
+             else "未确定游戏目录，退出。")
         return 1
 
     info("")
@@ -744,12 +782,31 @@ def run(args: argparse.Namespace) -> int:
     ok("游戏未运行")
 
     state = load_state()
-    install_key = str(install_dir.resolve())
-    pref_path = user_pref_path(version if version != "manual" else "steam", steam_appid)
+    install_key = _install_key(install_dir)
+    pref_path = user_pref_path(version, steam_appid)
 
     status, current_hashes = describe_state(install_key, stringtables, pref_path, state)
 
     info("")
+    if args.status:
+        return 0
+
+    if args.apply:
+        if status == "swapped":
+            info("已经处于互换状态，无需重复 apply。")
+            return 0
+        if status == "unknown" and not args.force:
+            fail("当前状态未知，拒绝盲操作。确认无误后加 --force 再试。")
+            return 2
+        return do_apply(install_key, stringtables, current_hashes, pref_path,
+                        state, fresh=(status == "unknown"), interactive=False)
+
+    if args.revert:
+        if status != "swapped":
+            info(f"当前状态为 {status}，无需还原。")
+            return 0
+        return do_revert(install_key, stringtables, pref_path, state)
+
     if status == "swapped":
         info(bold("操作选项："))
         info("  [1] 还原为原始语言包")
@@ -773,9 +830,14 @@ def run(args: argparse.Namespace) -> int:
 
 
 def do_apply(install_key: str, stringtables: Path, current_hashes: dict,
-             pref_path: Path | None, state: dict, fresh: bool) -> int:
+             pref_path: Path | None, state: dict, fresh: bool,
+             interactive: bool = True) -> int:
     if fresh:
-        warn("当前哈希与已知状态都不匹配，按全新原始状态处理（旧记录将被覆盖）。")
+        warn("当前哈希与已知状态都不匹配（可能游戏已更新或被手动改过）。")
+        if interactive and not ask_yes_no(
+                "是否把当前文件视为新的原始状态并互换？", default=False):
+            info("已取消。")
+            return 0
     info("执行互换...")
     try:
         swap_zips(stringtables)
@@ -864,6 +926,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--path", help="直接指定游戏安装目录（跳过自动检测）")
     p.add_argument("--no-uac", action="store_true", help="不在 Windows 上自动请求管理员")
     p.add_argument("--no-pause", action="store_true", help="结束时不暂停（CI / 脚本调用）")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--apply", action="store_true",
+                   help="非交互：直接应用（中文 UI + 日语配音）")
+    g.add_argument("--revert", action="store_true",
+                   help="非交互：还原为原始语言包")
+    g.add_argument("--status", action="store_true",
+                   help="非交互：仅打印当前状态后退出")
+    p.add_argument("--force", action="store_true",
+                   help="--apply 时即使状态未知也强行覆盖记录并互换")
     return p.parse_args(argv)
 
 
@@ -879,7 +950,8 @@ def main(argv: list[str] | None = None) -> int:
         import traceback
         traceback.print_exc()
         rc = 2
-    if not args.no_pause:
+    non_interactive = args.apply or args.revert or args.status
+    if not args.no_pause and not non_interactive:
         pause_before_exit()
     return rc
 
